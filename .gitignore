@@ -1,0 +1,14 @@
+# Byte-order mark
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 変換出力ファイル (テスト用 MDX/MML は除く)
+*.mml
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
