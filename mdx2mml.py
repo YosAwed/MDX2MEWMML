@@ -19,6 +19,7 @@ MDX フォーマット参考:
 import struct
 import sys
 import argparse
+from collections import Counter
 from pathlib import Path
 
 # ══════════════════════════════════════════════════════════════════
@@ -288,6 +289,133 @@ class MDX2MewMML:
         """FM 0-7 → A-H。MewMMLPad に PCM/ADPCM トラックはない。"""
         return chr(ord('A') + i)
 
+    def detect_opm_percussion(self, track_data: bytes) -> tuple[bool, str]:
+        """
+        OPM 音色でドラム/パーカッション的に使われているトラックを推定する。
+
+        MDX には「この FM トラックはドラム」という確定フラグがないため、
+        短音、音色切替、音程反復、疎なリズムを組み合わせたヒューリスティックにする。
+        """
+        notes = []
+        voice_changes = 0
+        note_voices = []
+        rest_ticks = 0
+        portamento_count = 0
+        current_voice = None
+
+        pos = 0
+        n = len(track_data)
+        safety = 0
+        while pos < n:
+            safety += 1
+            if safety > 500_000:
+                break
+
+            r = cmd_len(track_data, pos)
+            if r <= 0:
+                break
+
+            b = track_data[pos]
+            if b <= 0x7f:
+                rest_ticks += b + 1
+            elif b <= 0xdf:
+                ticks = (track_data[pos + 1] + 1) if pos + 1 < n else 1
+                note_num = b - 0x80
+                notes.append((note_num, ticks))
+                note_voices.append(current_voice)
+            elif b == 0xfd:
+                current_voice = track_data[pos + 1] if pos + 1 < n else 0
+                voice_changes += 1
+            elif b == 0xf2:
+                portamento_count += 1
+            elif b == 0xf1:
+                break
+
+            pos += r
+
+        note_count = len(notes)
+        if note_count < 8:
+            return False, ''
+
+        note_nums = [note for note, _ in notes]
+        durations = [ticks for _, ticks in notes]
+        note_ticks = sum(durations)
+        total_ticks = note_ticks + rest_ticks
+
+        short_ratio = sum(t <= 24 for t in durations) / note_count
+        very_short_ratio = sum(t <= 12 for t in durations) / note_count
+        long_ratio = sum(t >= 48 for t in durations) / note_count
+        avg_duration = note_ticks / note_count
+
+        pitch_counts = Counter(note_nums)
+        unique_notes = len(pitch_counts)
+        most_common_ratio = pitch_counts.most_common(1)[0][1] / note_count
+
+        used_voices = [v for v in note_voices if v is not None]
+        unique_voices = len(set(used_voices))
+        voice_change_rate = voice_changes / note_count
+
+        note_fill_ratio = note_ticks / total_ticks if total_ticks else 1.0
+
+        score = 0
+        reasons = []
+
+        if short_ratio >= 0.8:
+            score += 3
+            reasons.append(f'短音{short_ratio:.0%}')
+        elif short_ratio >= 0.6:
+            score += 2
+            reasons.append(f'短音{short_ratio:.0%}')
+        elif short_ratio >= 0.45:
+            score += 1
+
+        if very_short_ratio >= 0.5:
+            score += 1
+        if avg_duration <= 18:
+            score += 1
+        if long_ratio >= 0.25:
+            score -= 2
+
+        voice_signature = False
+        if unique_voices >= 3:
+            score += 2
+            voice_signature = True
+            reasons.append(f'音色{unique_voices}種')
+        elif unique_voices == 2 and voice_change_rate >= 0.15:
+            score += 1
+            voice_signature = True
+            reasons.append('音色切替あり')
+
+        if voice_change_rate >= 0.35:
+            score += 2
+            voice_signature = True
+        elif voice_change_rate >= 0.15:
+            score += 1
+            voice_signature = True
+
+        pitch_signature = False
+        if most_common_ratio >= 0.45:
+            score += 1
+            pitch_signature = True
+            reasons.append(f'反復音高{most_common_ratio:.0%}')
+        if unique_notes <= 4:
+            score += 1
+            pitch_signature = True
+            reasons.append(f'音高{unique_notes}種')
+
+        if note_fill_ratio <= 0.5:
+            score += 1
+            reasons.append(f'休符多め{1 - note_fill_ratio:.0%}')
+
+        if portamento_count:
+            score -= 2
+
+        if score < 5 or not (voice_signature or pitch_signature):
+            return False, ''
+
+        reason_text = ', '.join(dict.fromkeys(reasons)) or '短音/反復パターン'
+        return True, f'; 推定: OPMドラム/パーカッションの可能性 (score={score}; {reason_text})'
+
     def convert_track(self, track_idx: int, track_data: bytes) -> list:
         data = track_data
         n = len(data)
@@ -547,6 +675,9 @@ class MDX2MewMML:
         for i, td in enumerate(self.mdx.tracks[:8]):
             ch = self.track_name(i)
             toks = self.convert_track(i, td)
+            is_percussion, comment = self.detect_opm_percussion(td)
+            if is_percussion:
+                toks.insert(0, comment)
             if toks:
                 result[ch] = toks
         return result
@@ -593,13 +724,17 @@ def format_mewmml(
     for ch, tokens in valid_channels:
         lines.append(f'; --- Channel {ch} ---')
 
+        body_tokens = list(tokens)
+        while body_tokens and body_tokens[0].startswith(';'):
+            lines.append(body_tokens.pop(0))
+
         header = []
         if ch == default_tempo_channel:
             header.append('T120')
         header += ['O4', 'L8', 'V100']
 
         channel_tokens = []
-        for tok in tokens:
+        for tok in body_tokens:
             marker = parse_tempo_marker(tok)
             if marker is None:
                 channel_tokens.append(tok)
