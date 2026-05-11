@@ -12,3 +12,7 @@ __pycache__/
 
 # Windows
 Thumbs.db
+*:Zone.Identifier
+
+# Claude Code local
+.claude/
