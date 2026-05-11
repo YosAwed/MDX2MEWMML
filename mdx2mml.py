@@ -33,6 +33,7 @@ NOTE_NAMES_MDX = ["d+", "e", "f", "f+", "g", "g+", "a", "a+", "b", "c", "c+", "d
 
 # MewMMLPad は大文字音符 + "#" or "+" でシャープ, "-" でフラット
 NOTE_NAMES_MEW = ["D+", "E", "F", "F+", "G", "G+", "A", "A+", "B", "C", "C+", "D"]
+NOTE_NAMES_MEW_LOWER = [name.lower() for name in NOTE_NAMES_MEW]
 
 # ── Tick → 音符長変換テーブル ─────────────────────────────────────
 # 全音符 = 192 ticks, 4分音符 = 48 ticks
@@ -58,6 +59,8 @@ def is_tempo_token(token: str) -> bool:
 
 
 TEMPO_MARKER_PREFIX = '$$TEMPO:'
+REPEAT_ESCAPE_MARKER = '$$REPEAT_ESCAPE'
+GLOBAL_LOOP_MARKER = '$$GLOBAL_LOOP'
 
 
 def make_tempo_marker(tick: int, bpm: int) -> str:
@@ -171,7 +174,7 @@ def ticks_to_mml_lengths(ticks: int) -> list[str]:
     return [TICK_TO_LEN[p] for p in sorted(parts, reverse=True)]
 
 
-def timer_b_to_bpm(n: int) -> int:
+def timer_b_to_bpm(n: int, scale: float = 1.0) -> int:
     """
     タイマーB値 → BPM。
     mdx_compiler.c: timer_b = 256 - 78125/(16*bpm) の逆算:
@@ -180,7 +183,187 @@ def timer_b_to_bpm(n: int) -> int:
     div = 16 * (256 - n)
     if div <= 0:
         return 120
-    return max(1, min(round(78125 / div), 9999))
+    return max(1, min(round((78125 / div) * scale), 9999))
+
+
+def format_pan(pan_value: int) -> str:
+    """MDX の出力位相を MewMMLPad の P0-P127 形式へ変換する。"""
+    return {
+        0: '; P0 ; (no output)',
+        1: 'P0',
+        2: 'P127',
+        3: 'P64',
+    }.get(pan_value, 'P64')
+
+
+def format_volume(volume: int, command: str) -> str:
+    """MDX 音量値を 0-127 に正規化して Vn などで出力する。"""
+    if volume < 16:
+        normalized = round(volume * 127 / 15)
+    else:
+        tl = 255 - volume
+        normalized = max(0, min(127, 127 - tl))
+    return f'{command}{normalized}'
+
+
+def nonnegative_int(text: str) -> int:
+    """argparse 用の 0 以上 int パーサー。"""
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError('0以上の整数を指定してください')
+    return value
+
+
+def parse_repeat_end(token: str) -> int | None:
+    """']' または ']n' なら repeat count を返す。"""
+    if not token.startswith(']'):
+        return None
+    count_text = token[1:]
+    if not count_text:
+        return 2
+    return int(count_text) if count_text.isdigit() else None
+
+
+def expand_repeat_escapes(tokens: list[str]) -> list[str]:
+    """
+    MewMMLPad にリピート脱出構文がないため、脱出を含むループだけ展開する。
+
+    [ pre / post ]n は pre+post を n-1 回、最後に pre を出力する。
+    """
+    result = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok != '[':
+            result.append(tok)
+            i += 1
+            continue
+
+        depth = 1
+        j = i + 1
+        while j < len(tokens) and depth:
+            if tokens[j] == '[':
+                depth += 1
+            elif parse_repeat_end(tokens[j]) is not None:
+                depth -= 1
+            j += 1
+
+        if depth:
+            result.append(tok)
+            i += 1
+            continue
+
+        end_token = tokens[j - 1]
+        count = parse_repeat_end(end_token) or 2
+        inner = expand_repeat_escapes(tokens[i + 1:j - 1])
+
+        if REPEAT_ESCAPE_MARKER not in inner:
+            result.append('[')
+            result.extend(inner)
+            result.append(end_token)
+        else:
+            escape_idx = inner.index(REPEAT_ESCAPE_MARKER)
+            pre = inner[:escape_idx]
+            post = [t for t in inner[escape_idx + 1:] if t != REPEAT_ESCAPE_MARKER]
+            for _ in range(max(0, count - 1)):
+                result.extend(pre)
+                result.extend(post)
+            result.extend(pre)
+
+        i = j
+    return result
+
+
+LEN_TO_TICK = {v: k for k, v in TICK_TO_LEN.items()}
+
+
+def token_duration_ticks(token: str) -> int:
+    """変換後 MML トークンのおおよその tick 長を返す。"""
+    if not token or token.startswith(';') or token.startswith('$'):
+        return 0
+    if token in ('[', '<', '>', '(', ')'):
+        return 0
+    if parse_repeat_end(token) is not None:
+        return 0
+    if token[0] not in 'RrCcDdEeFfGgAaBb':
+        return 0
+
+    total = 0
+    for part in token.split('&'):
+        if not part:
+            continue
+        if part[0] not in 'RrCcDdEeFfGgAaBb':
+            continue
+        head = part.split('_', 1)[0]
+        idx = 1
+        if idx < len(head) and head[idx] in '+-#':
+            idx += 1
+        length = head[idx:]
+        total += LEN_TO_TICK.get(length, 24)
+    return total
+
+
+def tokens_duration_ticks(tokens: list[str]) -> int:
+    """リピート構文を考慮してトークン列の tick 長を返す。"""
+    total = 0
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok != '[':
+            total += token_duration_ticks(tok)
+            i += 1
+            continue
+
+        depth = 1
+        j = i + 1
+        while j < len(tokens) and depth:
+            if tokens[j] == '[':
+                depth += 1
+            elif parse_repeat_end(tokens[j]) is not None:
+                depth -= 1
+            j += 1
+
+        if depth:
+            i += 1
+            continue
+
+        count = parse_repeat_end(tokens[j - 1]) or 2
+        total += tokens_duration_ticks(tokens[i + 1:j - 1]) * count
+        i = j
+    return total
+
+
+def loop_body_duration_ticks(tokens: list[str]) -> int:
+    """グローバルループ点以降の tick 長を返す。"""
+    if GLOBAL_LOOP_MARKER not in tokens:
+        return 0
+    marker_idx = tokens.index(GLOBAL_LOOP_MARKER)
+    return tokens_duration_ticks(tokens[marker_idx + 1:])
+
+
+def rest_tokens_for_ticks(ticks: int) -> list[str]:
+    """指定 tick 分の休符トークンを作る。"""
+    return ['R' + length for length in ticks_to_mml_lengths(ticks)] if ticks > 0 else []
+
+
+def expand_global_loop(
+    tokens: list[str],
+    loop_count: int,
+    target_loop_ticks: int | None = None,
+) -> list[str]:
+    """グローバルループ点以降を指定回数ぶん展開し、必要なら区間末尾を休符で揃える。"""
+    if GLOBAL_LOOP_MARKER not in tokens:
+        return tokens
+    marker_idx = tokens.index(GLOBAL_LOOP_MARKER)
+    intro = tokens[:marker_idx]
+    loop_body = tokens[marker_idx + 1:]
+    loop_ticks = tokens_duration_ticks(loop_body)
+    pad_ticks = max(0, (target_loop_ticks or loop_ticks) - loop_ticks)
+    loop_body_with_pad = loop_body + rest_tokens_for_ticks(pad_ticks)
+    expanded = list(intro)
+    for _ in range(max(0, loop_count)):
+        expanded.extend(loop_body_with_pad)
+    return expanded
 
 
 def read_until(data: bytes, pos: int, terminator: bytes) -> tuple:
@@ -281,12 +464,27 @@ class MDX2MewMML:
     MewMMLPad コマンド体系に適合させたもの。
     """
 
-    def __init__(self, mdx: MDXFile):
+    def __init__(
+        self,
+        mdx: MDXFile,
+        tempo_scale: float = 1.0,
+        note_case: str = 'lower',
+        volume_command: str = 'V',
+        expand_repeat_escape: bool = True,
+        global_loop_count: int = 2,
+        include_pcm: bool = True,
+    ):
         self.mdx = mdx
+        self.tempo_scale = tempo_scale
+        self.note_names = NOTE_NAMES_MEW_LOWER if note_case == 'lower' else NOTE_NAMES_MEW
+        self.volume_command = volume_command
+        self.expand_repeat_escape = expand_repeat_escape
+        self.global_loop_count = global_loop_count
+        self.include_pcm = include_pcm
 
     @staticmethod
     def track_name(i: int) -> str:
-        """FM 0-7 → A-H。MewMMLPad に PCM/ADPCM トラックはない。"""
+        """FM 0-7 → A-H、PCM/ADPCM 8-15 → 仮想 I-P。"""
         return chr(ord('A') + i)
 
     def detect_opm_percussion(self, track_data: bytes) -> tuple[bool, str]:
@@ -470,7 +668,7 @@ class MDX2MewMML:
             # グローバルループマーカー
             if pos == loop_point:
                 flush_rest()
-                tokens.append('; === LOOP POINT ===')
+                tokens.append(GLOBAL_LOOP_MARKER)
                 octave = -1
 
             # ── Rest 0x00-0x7f (1 byte) ──────────────────────────
@@ -500,7 +698,7 @@ class MDX2MewMML:
                         tokens.extend(['>'] * (o - octave))
                     octave = o
 
-                note_name = NOTE_NAMES_MEW[note_num % 12]
+                note_name = self.note_names[note_num % 12]
                 # ポルタメント後処理
                 if portamento and track_idx < 8:
                     nn = note_num + portamento * (ticks + 1) // 16384
@@ -512,7 +710,7 @@ class MDX2MewMML:
                         octave = o2
                     len_str = ticks_to_mml_len(ticks)
                     tie = '&' if next_key_off else ''
-                    tokens.append(f'{note_name}{len_str}_{target_octave}{NOTE_NAMES_MEW[nn % 12]}{tie}')
+                    tokens.append(f'{note_name}{len_str}_{target_octave}{self.note_names[nn % 12]}{tie}')
                     portamento = 0
                     next_key_off = False
                 else:
@@ -533,7 +731,7 @@ class MDX2MewMML:
             if b == 0xff:
                 # テンポ設定
                 tb = data[pos + 1] if pos + 1 < n else 200
-                tokens.append(make_tempo_marker(elapsed_ticks, timer_b_to_bpm(tb)))
+                tokens.append(make_tempo_marker(elapsed_ticks, timer_b_to_bpm(tb, self.tempo_scale)))
 
             elif b == 0xfe:
                 # OPM レジスタ直書き (MewMMLPad 非対応 → コメント)
@@ -548,19 +746,12 @@ class MDX2MewMML:
             elif b == 0xfc:
                 # 出力位相 (パン): 1=右, 2=左, 3=両方(センター), 0=無音
                 pv = data[pos + 1] if pos + 1 < n else 3
-                pan_mml = {0: '; P0 ; (no output)', 1: 'PR63', 2: 'PL63', 3: 'PC'}
-                tokens.append(pan_mml.get(pv, 'PC'))
+                tokens.append(format_pan(pv))
 
             elif b == 0xfb:
                 # ボリューム設定
                 vol = data[pos + 1] if pos + 1 < n else 0
-                if vol < 16:
-                    # 相対ボリューム 0-15 → V0-127
-                    tokens.append(f'V{round(vol * 127 / 15)}')
-                else:
-                    # OPM TL 系: 255-vol = TL (0=大, 127=小) → 反転して V0-127
-                    tl = 255 - vol
-                    tokens.append(f'V{max(0, min(127, 127 - tl))}')
+                tokens.append(format_volume(vol, self.volume_command))
 
             elif b == 0xfa:
                 tokens.append(')')   # ボリューム上げ
@@ -600,8 +791,8 @@ class MDX2MewMML:
                 octave = -1
 
             elif b == 0xf4:
-                # リピート脱出 (MewMMLPad 非対応 → コメント)
-                tokens.append('; /')
+                # リピート脱出。MewMMLPad 非対応のため整形前にループ展開する。
+                tokens.append(REPEAT_ESCAPE_MARKER if self.expand_repeat_escape else '; /')
 
             elif b == 0xf3:
                 # デチューン (符号付き 16-bit)
@@ -667,19 +858,33 @@ class MDX2MewMML:
             pos += r
 
         flush_rest()
+        if self.expand_repeat_escape:
+            tokens = expand_repeat_escapes(tokens)
+            tokens = ['; /' if t == REPEAT_ESCAPE_MARKER else t for t in tokens]
         return tokens
 
     def convert(self) -> dict:
-        """FM 8 トラックを {チャンネル名: トークンリスト} に変換する。"""
+        """各トラックを {チャンネル名: トークンリスト} に変換する。"""
         result = {}
-        for i, td in enumerate(self.mdx.tracks[:8]):
+        track_limit = 16 if self.include_pcm else 8
+        for i, td in enumerate(self.mdx.tracks[:track_limit]):
             ch = self.track_name(i)
             toks = self.convert_track(i, td)
-            is_percussion, comment = self.detect_opm_percussion(td)
+            is_percussion, comment = self.detect_opm_percussion(td) if i < 8 else (False, '')
             if is_percussion:
                 toks.insert(0, comment)
             if toks:
                 result[ch] = toks
+
+        loop_target_ticks = max(
+            (loop_body_duration_ticks(tokens) for tokens in result.values()),
+            default=0,
+        )
+        if loop_target_ticks:
+            result = {
+                ch: expand_global_loop(tokens, self.global_loop_count, loop_target_ticks)
+                for ch, tokens in result.items()
+            }
         return result
 
 # ══════════════════════════════════════════════════════════════════
@@ -691,6 +896,7 @@ def format_mewmml(
     title: str = '',
     pdx: str = '',
     line_width: int = 120,
+    volume_command: str = 'V',
 ) -> str:
     """
     MewMMLPad テキスト形式に整形する。
@@ -708,11 +914,13 @@ def format_mewmml(
         '; ============================================================',
         '; MewMMLPad で開いてそのまま再生できます。',
         '; @n = MIDI プログラムチェンジ番号',
+        f'; {volume_command}n = 変換後ボリューム',
         '; ; で始まるトークン = 変換不可コマンド (デチューン等)',
         '',
     ]
 
-    valid_channels = [(ch, tokens) for ch, tokens in channels.items() if ch in 'ABCDEFGH']
+    valid_channel_names = 'ABCDEFGHIJKLMNOP'
+    valid_channels = [(ch, tokens) for ch, tokens in channels.items() if ch in valid_channel_names]
     has_any_tempo = any(
         parse_tempo_marker(t) is not None or is_tempo_token(t)
         for _, tokens in valid_channels
@@ -731,7 +939,7 @@ def format_mewmml(
         header = []
         if ch == default_tempo_channel:
             header.append('T120')
-        header += ['O4', 'L8', 'V100']
+        header += ['O4', 'L8', f'{volume_command}100']
 
         channel_tokens = []
         for tok in body_tokens:
@@ -748,7 +956,7 @@ def format_mewmml(
 
         all_toks = header + channel_tokens
 
-        # 行折り返し。演奏行は必ずチャンネル文字 A-H で始める。
+        # 行折り返し。演奏行は必ずチャンネル文字で始める。
         cur = ch
         def emit_current():
             nonlocal cur
@@ -777,7 +985,17 @@ def format_mewmml(
 # メイン変換処理
 # ══════════════════════════════════════════════════════════════════
 
-def convert(mdx_path: str, output_path: str = None, dump: bool = False) -> str:
+def convert(
+    mdx_path: str,
+    output_path: str = None,
+    dump: bool = False,
+    tempo_scale: float = 1.0,
+    note_case: str = 'lower',
+    volume_command: str = 'V',
+    expand_repeat_escape: bool = True,
+    global_loop_count: int = 2,
+    include_pcm: bool = True,
+) -> str:
     path = Path(mdx_path)
     if not path.exists():
         raise FileNotFoundError(f'MDX ファイルが見つかりません: {mdx_path}')
@@ -793,13 +1011,26 @@ def convert(mdx_path: str, output_path: str = None, dump: bool = False) -> str:
     print(f'      音色数      : {mdx.num_voices}')
 
     print('[3/4] MewMMLPad MML に変換中...')
-    conv = MDX2MewMML(mdx)
+    conv = MDX2MewMML(
+        mdx,
+        tempo_scale=tempo_scale,
+        note_case=note_case,
+        volume_command=volume_command,
+        expand_repeat_escape=expand_repeat_escape,
+        global_loop_count=global_loop_count,
+        include_pcm=include_pcm,
+    )
     channels = conv.convert()
     for ch, toks in channels.items():
         print(f'      ch {ch}: {len(toks)} トークン')
 
     print('[4/4] テキスト整形中...')
-    mml_text = format_mewmml(channels, title=mdx.title, pdx=mdx.pdx_filename)
+    mml_text = format_mewmml(
+        channels,
+        title=mdx.title,
+        pdx=mdx.pdx_filename,
+        volume_command=volume_command,
+    )
 
     out = Path(output_path) if output_path else path.with_suffix('.mml')
     out.write_text(mml_text, encoding='utf-8')
@@ -824,15 +1055,61 @@ def main():
   python mdx2mml.py song.mdx
   python mdx2mml.py song.mdx -o output.mml
   python mdx2mml.py song.mdx --dump
+  python mdx2mml.py song.mdx --tempo-scale 0.5 --note-case upper --volume-command V --global-loop-count 3
         '''
     )
     ap.add_argument('mdx_file')
     ap.add_argument('-o', '--output', default=None)
     ap.add_argument('--dump', action='store_true')
+    ap.add_argument(
+        '--tempo-scale',
+        type=float,
+        choices=(0.5, 1.0, 2.0),
+        default=1.0,
+        help='テンポを 0.5倍 / 1倍 / 2倍で出力する',
+    )
+    ap.add_argument(
+        '--note-case',
+        choices=('lower', 'upper'),
+        default='lower',
+        help='音符名の大小文字。既定は lower',
+    )
+    ap.add_argument(
+        '--volume-command',
+        choices=('V', 'v', '@V'),
+        default='V',
+        help='MDX ボリュームの出力コマンド。既定は V',
+    )
+    ap.add_argument(
+        '--no-expand-repeat-escape',
+        action='store_true',
+        help='リピート脱出を展開せずコメントとして残す',
+    )
+    ap.add_argument(
+        '--global-loop-count',
+        type=nonnegative_int,
+        default=2,
+        help='グローバルループ点以降を展開する回数。既定は 2',
+    )
+    ap.add_argument(
+        '--no-pcm',
+        action='store_true',
+        help='PCM/ADPCM トラック(仮想I-P)を出力しない',
+    )
     args = ap.parse_args()
 
     try:
-        convert(args.mdx_file, args.output, args.dump)
+        convert(
+            args.mdx_file,
+            args.output,
+            args.dump,
+            tempo_scale=args.tempo_scale,
+            note_case=args.note_case,
+            volume_command=args.volume_command,
+            expand_repeat_escape=not args.no_expand_repeat_escape,
+            global_loop_count=args.global_loop_count,
+            include_pcm=not args.no_pcm,
+        )
     except (FileNotFoundError, ValueError) as e:
         print(f'エラー: {e}', file=sys.stderr)
         sys.exit(1)
