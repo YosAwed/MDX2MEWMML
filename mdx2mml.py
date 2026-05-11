@@ -37,19 +37,27 @@ NOTE_NAMES_MEW_LOWER = [name.lower() for name in NOTE_NAMES_MEW]
 
 # ── Tick → 音符長変換テーブル ─────────────────────────────────────
 # 全音符 = 192 ticks, 4分音符 = 48 ticks
-# MewMMLPad の仕様内にある 1〜32 分音符と付点だけを出力する。
+# MewMMLPad の数値音長で表せるものはできるだけ exact に出力する。
 TICK_TO_LEN: dict = {
     192: "1",
     144: "2.",
     96:  "2",
     72:  "4.",
+    64:  "3",
     48:  "4",
     36:  "8.",
+    32:  "6",
     24:  "8",
     18:  "16.",
+    16:  "12",
     12:  "16",
     9:   "32.",
+    8:   "24",
     6:   "32",
+    4:   "48",
+    3:   "64",
+    2:   "96",
+    1:   "192",
 }
 
 
@@ -224,11 +232,12 @@ def parse_repeat_end(token: str) -> int | None:
     return int(count_text) if count_text.isdigit() else None
 
 
-def expand_repeat_escapes(tokens: list[str]) -> list[str]:
+def expand_repeats(tokens: list[str], expand_escape: bool = True) -> list[str]:
     """
-    MewMMLPad にリピート脱出構文がないため、脱出を含むループだけ展開する。
+    ローカルリピートを展開する。
 
     [ pre / post ]n は pre+post を n-1 回、最後に pre を出力する。
+    グローバルループ点がリピート内部に入る MDX があるため、通常リピートも展開する。
     """
     result = []
     i = 0
@@ -255,12 +264,11 @@ def expand_repeat_escapes(tokens: list[str]) -> list[str]:
 
         end_token = tokens[j - 1]
         count = parse_repeat_end(end_token) or 2
-        inner = expand_repeat_escapes(tokens[i + 1:j - 1])
+        inner = expand_repeats(tokens[i + 1:j - 1], expand_escape)
 
-        if REPEAT_ESCAPE_MARKER not in inner:
-            result.append('[')
-            result.extend(inner)
-            result.append(end_token)
+        if REPEAT_ESCAPE_MARKER not in inner or not expand_escape:
+            for _ in range(max(0, count)):
+                result.extend(inner)
         else:
             escape_idx = inner.index(REPEAT_ESCAPE_MARKER)
             pre = inner[:escape_idx]
@@ -294,7 +302,7 @@ def token_duration_ticks(token: str) -> int:
             continue
         if part[0] not in 'RrCcDdEeFfGgAaBb':
             continue
-        head = part.split('_', 1)[0]
+        head = part.split('_', 1)[0].rstrip('^&')
         idx = 1
         if idx < len(head) and head[idx] in '+-#':
             idx += 1
@@ -364,6 +372,54 @@ def expand_global_loop(
     for _ in range(max(0, loop_count)):
         expanded.extend(loop_body_with_pad)
     return expanded
+
+
+def split_global_segments(tokens: list[str]) -> list[list[str]]:
+    """内部グローバルループマーカーでトークン列を分割する。"""
+    segments = [[]]
+    for token in tokens:
+        if token == GLOBAL_LOOP_MARKER:
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    return segments
+
+
+def align_global_loop_segments(channels: dict[str, list[str]]) -> dict[str, list[str]]:
+    """F1 ループ境界ごとに全チャンネルの長さを休符で揃える。"""
+    if not any(GLOBAL_LOOP_MARKER in tokens for tokens in channels.values()):
+        return channels
+
+    split = {ch: split_global_segments(tokens) for ch, tokens in channels.items()}
+    segment_count = max((len(segments) for segments in split.values()), default=0)
+    target_ticks = []
+    for index in range(segment_count):
+        target_ticks.append(max(
+            (
+                tokens_duration_ticks(segments[index])
+                for segments in split.values()
+                if index < len(segments)
+            ),
+            default=0,
+        ))
+
+    aligned = {}
+    for ch, segments in split.items():
+        tokens = []
+        for index, target in enumerate(target_ticks):
+            segment = segments[index] if index < len(segments) else []
+            tokens.extend(segment)
+            tokens.extend(rest_tokens_for_ticks(target - tokens_duration_ticks(segment)))
+        aligned[ch] = tokens
+    return aligned
+
+
+def remove_internal_markers(channels: dict[str, list[str]]) -> dict[str, list[str]]:
+    """出力前に内部マーカーを取り除く。"""
+    return {
+        ch: [token for token in tokens if token != GLOBAL_LOOP_MARKER]
+        for ch, tokens in channels.items()
+    }
 
 
 def read_until(data: bytes, pos: int, terminator: bytes) -> tuple:
@@ -624,6 +680,10 @@ class MDX2MewMML:
         next_key_off = False   # 0xf7 フラグ (次の音符に & を付ける)
         portamento = 0         # ポルタメント値 (符号付き int)
         elapsed_ticks = 0      # テンポ同時発生判定用のトラック内 tick
+        repeat_stack = []      # 実行中ローカルリピート
+        loop_stack_snapshot = None
+        loop_state_snapshot = None
+        global_loops_done = 0
 
         # ── グローバルループ点を先行スキャン ─────────────────────
         loop_point = -1
@@ -665,11 +725,16 @@ class MDX2MewMML:
 
             b = data[pos]
 
-            # グローバルループマーカー
+            # グローバルループ点。リピート途中を指す場合があるため、
+            # 初回到達時のリピート状態を F1 ループ時に復元する。
             if pos == loop_point:
                 flush_rest()
-                tokens.append(GLOBAL_LOOP_MARKER)
-                octave = -1
+                if loop_stack_snapshot is None:
+                    loop_stack_snapshot = [dict(item) for item in repeat_stack]
+                    loop_state_snapshot = {
+                        'next_key_off': next_key_off,
+                        'portamento': portamento,
+                    }
 
             # ── Rest 0x00-0x7f (1 byte) ──────────────────────────
             if b <= 0x7f:
@@ -701,23 +766,14 @@ class MDX2MewMML:
                 note_name = self.note_names[note_num % 12]
                 # ポルタメント後処理
                 if portamento and track_idx < 8:
-                    nn = note_num + portamento * (ticks + 1) // 16384
-                    nn = max(0, min(95, nn))
-                    o2 = note_octave(nn)
-                    target_octave = ''
-                    if o2 != octave:
-                        target_octave = ('>' if o2 > octave else '<') * abs(o2 - octave)
-                        octave = o2
-                    len_str = ticks_to_mml_len(ticks)
-                    tie = '&' if next_key_off else ''
-                    tokens.append(f'{note_name}{len_str}_{target_octave}{self.note_names[nn % 12]}{tie}')
+                    len_parts = ticks_to_mml_lengths(ticks)
+                    note_token = '&'.join(f'{note_name}{len_str}' for len_str in len_parts)
+                    tokens.append(note_token)
                     portamento = 0
                     next_key_off = False
                 else:
                     len_parts = ticks_to_mml_lengths(ticks)
                     note_token = '&'.join(f'{note_name}{len_str}' for len_str in len_parts)
-                    if next_key_off:
-                        note_token += '&'
                     tokens.append(note_token)
                     next_key_off = False
 
@@ -772,27 +828,34 @@ class MDX2MewMML:
                 next_key_off = True
 
             elif b == 0xf6:
-                # リピート開始 (byte2 = count)
-                tokens.append('[')
-                octave = -1
+                # リピート開始 (byte2 = count)。MewMML 側の構文にせず、
+                # MDX バイトコードとして展開する。
+                count = data[pos + 1] if pos + 1 < n else 2
+                repeat_stack.append({'start': pos + r, 'remaining': max(1, count)})
 
             elif b == 0xf5:
                 # リピート終端: 相対オフセットで 0xf6 の count バイトを参照
-                if pos + 2 < n:
-                    raw16 = (data[pos + 1] << 8) | data[pos + 2]
-                    ofs16 = (raw16 - 65536 if raw16 >= 32768 else raw16) + 1
-                    target = pos + ofs16
-                    if 0 <= target < n and data[target] > 2:
-                        tokens.append(f']{data[target]}')
-                    else:
-                        tokens.append(']')
-                else:
-                    tokens.append(']')
-                octave = -1
+                if repeat_stack:
+                    current_repeat = repeat_stack[-1]
+                    if current_repeat['remaining'] > 1:
+                        current_repeat['remaining'] -= 1
+                        next_key_off = False
+                        portamento = 0
+                        pos = current_repeat['start']
+                        continue
+                    repeat_stack.pop()
 
             elif b == 0xf4:
-                # リピート脱出。MewMMLPad 非対応のため整形前にループ展開する。
-                tokens.append(REPEAT_ESCAPE_MARKER if self.expand_repeat_escape else '; /')
+                # リピート脱出。最後の繰り返しでは終端直後へスキップする。
+                if repeat_stack and repeat_stack[-1]['remaining'] == 1 and pos + 2 < n:
+                    raw16 = (data[pos + 1] << 8) | data[pos + 2]
+                    ofs16 = (raw16 - 65536 if raw16 >= 32768 else raw16) + 2
+                    target = pos + ofs16
+                    if 0 <= target <= n:
+                        next_key_off = False
+                        portamento = 0
+                        pos = target
+                        continue
 
             elif b == 0xf3:
                 # デチューン (符号付き 16-bit)
@@ -808,7 +871,18 @@ class MDX2MewMML:
                     portamento = raw - 65536 if raw >= 32768 else raw
 
             elif b == 0xf1:
-                # データ終端 → 変換終了
+                # データ終端。ループポインタがあれば有限回だけ再演奏する。
+                extra_loop_count = max(0, self.global_loop_count - 1)
+                if loop_point >= 0 and global_loops_done < extra_loop_count:
+                    flush_rest()
+                    tokens.append(GLOBAL_LOOP_MARKER)
+                    global_loops_done += 1
+                    repeat_stack = [dict(item) for item in (loop_stack_snapshot or [])]
+                    if loop_state_snapshot:
+                        next_key_off = loop_state_snapshot['next_key_off']
+                        portamento = loop_state_snapshot['portamento']
+                    pos = loop_point
+                    continue
                 break
 
             elif b == 0xf0:
@@ -858,9 +932,6 @@ class MDX2MewMML:
             pos += r
 
         flush_rest()
-        if self.expand_repeat_escape:
-            tokens = expand_repeat_escapes(tokens)
-            tokens = ['; /' if t == REPEAT_ESCAPE_MARKER else t for t in tokens]
         return tokens
 
     def convert(self) -> dict:
@@ -876,16 +947,7 @@ class MDX2MewMML:
             if toks:
                 result[ch] = toks
 
-        loop_target_ticks = max(
-            (loop_body_duration_ticks(tokens) for tokens in result.values()),
-            default=0,
-        )
-        if loop_target_ticks:
-            result = {
-                ch: expand_global_loop(tokens, self.global_loop_count, loop_target_ticks)
-                for ch, tokens in result.items()
-            }
-        return result
+        return remove_internal_markers(result)
 
 # ══════════════════════════════════════════════════════════════════
 # MewMMLPad MML フォーマッター
@@ -969,7 +1031,7 @@ def format_mewmml(
             if tok.startswith(';'):
                 emit_current()
                 lines.append(tok)
-            elif cur.endswith('&'):
+            elif cur.endswith(('&', '^')):
                 cur += tok
             elif len(cur) + 1 + len(tok) > line_width:
                 emit_current()
@@ -1089,7 +1151,7 @@ def main():
         '--global-loop-count',
         type=nonnegative_int,
         default=2,
-        help='グローバルループ点以降を展開する回数。既定は 2',
+        help='グローバルループ点以降の総再生回数。既定は 2',
     )
     ap.add_argument(
         '--no-pcm',
