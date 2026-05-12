@@ -302,8 +302,13 @@ def token_duration_ticks(token: str) -> int:
             continue
         if part[0] not in 'RrCcDdEeFfGgAaBb':
             continue
-        head = part.split('_', 1)[0].rstrip('^&')
-        idx = 1
+        # ポルタメント `source_target<len>` 形式は target 側の長さを取る。
+        # それ以外は source 側の長さを取る。
+        if '_' in part:
+            head = part.split('_', 1)[1].rstrip('^&')
+        else:
+            head = part.rstrip('^&')
+        idx = 1 if head and head[0] in 'RrCcDdEeFfGgAaBb' else 0
         if idx < len(head) and head[idx] in '+-#':
             idx += 1
         length = head[idx:]
@@ -529,6 +534,7 @@ class MDX2MewMML:
         expand_repeat_escape: bool = True,
         global_loop_count: int = 2,
         include_pcm: bool = True,
+        emit_portamento: bool = False,
     ):
         self.mdx = mdx
         self.tempo_scale = tempo_scale
@@ -537,6 +543,7 @@ class MDX2MewMML:
         self.expand_repeat_escape = expand_repeat_escape
         self.global_loop_count = global_loop_count
         self.include_pcm = include_pcm
+        self.emit_portamento = emit_portamento
 
     @staticmethod
     def track_name(i: int) -> str:
@@ -684,6 +691,8 @@ class MDX2MewMML:
         loop_stack_snapshot = None
         loop_state_snapshot = None
         global_loops_done = 0
+        prev_note_name = None  # 直前ノートの名前 (ポルタメント源)
+        prev_note_octave = None  # 直前ノートのオクターブ
 
         # ── グローバルループ点を先行スキャン ─────────────────────
         loop_point = -1
@@ -767,9 +776,25 @@ class MDX2MewMML:
                     octave = o
 
                 note_name = self.note_names[note_num % 12]
-                # ポルタメント後処理
                 len_parts = ticks_to_mml_lengths(ticks)
-                note_token = '&'.join(f'{note_name}{len_str}' for len_str in len_parts)
+
+                # ポルタメント: MewMMLPad の `source_target<len>` 形式 (即ベンド) に変換。
+                # 同一オクターブのときだけ採用 (MDX の補間カーブは保持不可)。
+                # 音価が複数に分解される場合は先頭にベンドを乗せ残りはターゲット音をタイで継続。
+                porta_ok = (
+                    self.emit_portamento
+                    and portamento
+                    and track_idx < 8
+                    and prev_note_name is not None
+                    and prev_note_octave == o
+                )
+                if porta_ok:
+                    head = f'{prev_note_name}_{note_name}{len_parts[0]}'
+                    tail = ''.join(f'&{note_name}{l}' for l in len_parts[1:])
+                    note_token = head + tail
+                else:
+                    note_token = '&'.join(f'{note_name}{l}' for l in len_parts)
+
                 # 0xf7 (キーオフ無効) で次音と連結 (タイ) させる
                 if next_key_off:
                     note_token += '&'
@@ -777,6 +802,8 @@ class MDX2MewMML:
                 if portamento and track_idx < 8:
                     portamento = 0
                 next_key_off = False
+                prev_note_name = note_name
+                prev_note_octave = o
 
                 elapsed_ticks += ticks
                 pos += 2
@@ -1061,6 +1088,7 @@ def convert(
     expand_repeat_escape: bool = True,
     global_loop_count: int = 2,
     include_pcm: bool = True,
+    emit_portamento: bool = False,
 ) -> str:
     path = Path(mdx_path)
     if not path.exists():
@@ -1085,6 +1113,7 @@ def convert(
         expand_repeat_escape=expand_repeat_escape,
         global_loop_count=global_loop_count,
         include_pcm=include_pcm,
+        emit_portamento=emit_portamento,
     )
     channels = conv.convert()
     for ch, toks in channels.items():
@@ -1162,6 +1191,11 @@ def main():
         action='store_true',
         help='PCM/ADPCM トラック(仮想I-P)を出力しない',
     )
+    ap.add_argument(
+        '--portamento',
+        action='store_true',
+        help='MDX のポルタメント (0xf2) を MewMMLPad の即ベンド構文 (a_b4) に変換する',
+    )
     args = ap.parse_args()
 
     try:
@@ -1175,6 +1209,7 @@ def main():
             expand_repeat_escape=not args.no_expand_repeat_escape,
             global_loop_count=args.global_loop_count,
             include_pcm=not args.no_pcm,
+            emit_portamento=args.portamento,
         )
     except (FileNotFoundError, ValueError) as e:
         print(f'エラー: {e}', file=sys.stderr)
