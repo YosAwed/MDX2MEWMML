@@ -58,7 +58,7 @@ python mdx2mml.py song.mdx --tempo-scale 0.5 --note-case upper --global-loop-cou
 | `0xF6` / `0xF5` | ループ開始/終了 | ループを展開 |
 | `0xF4` | ループ脱出 | ループを展開 |
 | `0xF3` | デチューン | `; D{val}` (コメント) |
-| `0xF2` | ポルタメント | 既定では音価のみ近似、`--portamento` で `{source}_{target}{len}` |
+| `0xF2` | ポルタメント | 既定では音価のみ近似、`--portamento` で `{source}{len}_{target}` |
 | `0xF1` | トラック終端 | 変換終了 |
 
 ### MewMMLPad 非対応コマンド
@@ -84,7 +84,7 @@ FM トラックのうち、短音が多い・音色切替が多い・少数音�
 - `--no-expand-repeat-escape`: リピート脱出を展開せず、コメントとして残します。通常のローカルリピートはグローバルループ位置を保つため常に展開します。
 - `--global-loop-count N`: グローバルループ点以降を合計 `N` 回ぶん再生するように展開します。既定は `2` です。
 - `--no-pcm`: 9ch 以降の PCM/ADPCM トラックを仮想 `I`-`P` チャンネルとして出力しません。
-- `--portamento`: MDX のポルタメント (`0xF2`) を MewMMLPad の即ベンド構文 (`a_b4`) に変換します。
+- `--portamento`: MDX のポルタメント (`0xF2`) を MewMMLPad の即ベンド構文 (`a4_b`) に変換します。
 
 ## 出力例
 

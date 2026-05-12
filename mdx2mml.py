@@ -302,13 +302,12 @@ def token_duration_ticks(token: str) -> int:
             continue
         if part[0] not in 'RrCcDdEeFfGgAaBb':
             continue
-        # ポルタメント `source_target<len>` 形式は target 側の長さを取る。
-        # それ以外は source 側の長さを取る。
+        # ポルタメント `source<len>_target` 形式は source 側の長さを取る。
         if '_' in part:
-            head = part.split('_', 1)[1].rstrip('^&')
+            head = part.split('_', 1)[0].rstrip('^&')
         else:
             head = part.rstrip('^&')
-        idx = 1 if head and head[0] in 'RrCcDdEeFfGgAaBb' else 0
+        idx = 1
         if idx < len(head) and head[idx] in '+-#':
             idx += 1
         length = head[idx:]
@@ -691,8 +690,6 @@ class MDX2MewMML:
         loop_stack_snapshot = None
         loop_state_snapshot = None
         global_loops_done = 0
-        prev_note_name = None  # 直前ノートの名前 (ポルタメント源)
-        prev_note_octave = None  # 直前ノートのオクターブ
 
         # ── グローバルループ点を先行スキャン ─────────────────────
         loop_point = -1
@@ -778,19 +775,24 @@ class MDX2MewMML:
                 note_name = self.note_names[note_num % 12]
                 len_parts = ticks_to_mml_lengths(ticks)
 
-                # ポルタメント: MewMMLPad の `source_target<len>` 形式 (即ベンド) に変換。
-                # 同一オクターブのときだけ採用 (MDX の補間カーブは保持不可)。
+                # ポルタメント: MewMMLPad の `source<len>_target` 形式 (即ベンド) に変換。
+                # MDX の補間カーブは保持できないため、0xf2 の変化量から終点音程を近似する。
                 # 音価が複数に分解される場合は先頭にベンドを乗せ残りはターゲット音をタイで継続。
                 porta_ok = (
                     self.emit_portamento
                     and portamento
                     and track_idx < 8
-                    and prev_note_name is not None
-                    and prev_note_octave == o
                 )
                 if porta_ok:
-                    head = f'{prev_note_name}_{note_name}{len_parts[0]}'
-                    tail = ''.join(f'&{note_name}{l}' for l in len_parts[1:])
+                    target_note_num = max(0, min(95, note_num + portamento * (ticks + 1) // 16384))
+                    target_octave = note_octave(target_note_num)
+                    target_octave_token = ''
+                    if target_octave != octave:
+                        target_octave_token = ('>' if target_octave > octave else '<') * abs(target_octave - octave)
+                    target_note_name = self.note_names[target_note_num % 12]
+                    head = f'{note_name}{len_parts[0]}_{target_octave_token}{target_note_name}'
+                    tail = ''.join(f'&{target_note_name}{l}' for l in len_parts[1:])
+                    octave = target_octave
                     note_token = head + tail
                 else:
                     note_token = '&'.join(f'{note_name}{l}' for l in len_parts)
@@ -802,8 +804,6 @@ class MDX2MewMML:
                 if portamento and track_idx < 8:
                     portamento = 0
                 next_key_off = False
-                prev_note_name = note_name
-                prev_note_octave = o
 
                 elapsed_ticks += ticks
                 pos += 2
@@ -1194,7 +1194,7 @@ def main():
     ap.add_argument(
         '--portamento',
         action='store_true',
-        help='MDX のポルタメント (0xf2) を MewMMLPad の即ベンド構文 (a_b4) に変換する',
+        help='MDX のポルタメント (0xf2) を MewMMLPad の即ベンド構文 (a4_b) に変換する',
     )
     args = ap.parse_args()
 
