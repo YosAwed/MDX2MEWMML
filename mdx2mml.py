@@ -697,7 +697,10 @@ class MDX2MewMML:
                     hi, lo = data[sp + 1], data[sp + 2]
                     raw = (hi << 8) | lo
                     signed_ofs = raw - 65536 if raw >= 32768 else raw
-                    lp = sp + signed_ofs + 1
+                    # mdxtools mdx_driver.c 準拠: pos += ofs + 3 でループ点に飛ぶ。
+                    # 旧コードは +1 で 2 バイト早い位置に着地し、L 直前の音符を
+                    # ループ外に取り残してトラック間の tick がずれていた。
+                    lp = sp + signed_ofs + 3
                     if 0 <= lp < n and hi != 0:
                         loop_point = lp
                 break
@@ -846,14 +849,17 @@ class MDX2MewMML:
                     repeat_stack.pop()
 
             elif b == 0xf4:
-                # リピート脱出。最後の繰り返しでは終端直後へスキップする。
+                # リピート脱出。最後の繰り返しでは ] の直後へスキップする。
+                # mdxtools mdx_driver.c 準拠:
+                #   pos += 3; pos += ofs + 2  →  最終 pos = f5_pos + 3
+                # 直接そこに飛ばし、リピートスタックを明示的に pop する。
+                # ポルタメント / キーオフ抑止フラグはループ外へ持ち越すため温存する。
                 if repeat_stack and repeat_stack[-1]['remaining'] == 1 and pos + 2 < n:
                     raw16 = (data[pos + 1] << 8) | data[pos + 2]
-                    ofs16 = (raw16 - 65536 if raw16 >= 32768 else raw16) + 2
-                    target = pos + ofs16
+                    signed = raw16 - 65536 if raw16 >= 32768 else raw16
+                    target = pos + signed + 5
                     if 0 <= target <= n:
-                        next_key_off = False
-                        portamento = 0
+                        repeat_stack.pop()
                         pos = target
                         continue
 
