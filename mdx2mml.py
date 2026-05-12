@@ -768,17 +768,15 @@ class MDX2MewMML:
 
                 note_name = self.note_names[note_num % 12]
                 # ポルタメント後処理
+                len_parts = ticks_to_mml_lengths(ticks)
+                note_token = '&'.join(f'{note_name}{len_str}' for len_str in len_parts)
+                # 0xf7 (キーオフ無効) で次音と連結 (タイ) させる
+                if next_key_off:
+                    note_token += '&'
+                tokens.append(note_token)
                 if portamento and track_idx < 8:
-                    len_parts = ticks_to_mml_lengths(ticks)
-                    note_token = '&'.join(f'{note_name}{len_str}' for len_str in len_parts)
-                    tokens.append(note_token)
                     portamento = 0
-                    next_key_off = False
-                else:
-                    len_parts = ticks_to_mml_lengths(ticks)
-                    note_token = '&'.join(f'{note_name}{len_str}' for len_str in len_parts)
-                    tokens.append(note_token)
-                    next_key_off = False
+                next_key_off = False
 
                 elapsed_ticks += ticks
                 pos += 2
