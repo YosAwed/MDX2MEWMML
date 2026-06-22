@@ -6,6 +6,7 @@ __pycache__/
 
 # 変換出力ファイル (テスト用 MDX/MML は除く)
 *.mml
+!tests/fixtures/**/*.mdx
 
 # macOS
 .DS_Store

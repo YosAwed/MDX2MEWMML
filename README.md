@@ -25,9 +25,20 @@ python mdx2mml.py song.mdx -o output.mml
 # 変換結果を標準出力にも表示
 python mdx2mml.py song.mdx --dump
 
-# テンポを半分、音符名を大文字、全体ループ3回にする
+# 変換精度レポート (tick 長・DESYNC・非対応コマンド)
+python mdx2mml.py song.mdx --report
+
+# テンポ BPM 表示のみ半分、音符名大文字、全体ループ3回
 python mdx2mml.py song.mdx --tempo-scale 0.5 --note-case upper --global-loop-count 3
 ```
+
+## テスト
+
+```bash
+python -m pytest tests/ -v
+```
+
+合成 MDX fixture は `tests/fixtures/build_mdx.py`、手動試聴手順は `tests/MANUAL_CHECKLIST.md` を参照してください。
 
 ## 変換仕様
 
@@ -59,18 +70,26 @@ python mdx2mml.py song.mdx --tempo-scale 0.5 --note-case upper --global-loop-cou
 | `0xF4` | ループ脱出 | ループを展開 |
 | `0xF3` | デチューン | `; D{val}` (コメント) |
 | `0xF2` | ポルタメント | 既定では音価のみ近似、`--portamento` で `{source}{len}_{target}` |
+| `0xF0` | キーオンディレイ | 次音符直前に `; k{n}` (タイムライン tick は不変) |
+| `0xEF` | Sync send | `; S{ch}` (コメント) |
+| `0xEE` | Sync wait | 内部処理後、他 ch に合わせて休符パディング |
+| `0xE8` | PCM enable | PCM トラックで `; PCM enable` |
+| `0xE7` | Extended MML | `; E7 sub,val` (コメント) |
 | `0xF1` | トラック終端 | 変換終了 |
 
 ### MewMMLPad 非対応コマンド
 
-以下は MewMMLPad に対応コマンドがないため、`;` コメント行として出力されます:
+以下は MewMMLPad に対応コマンドがないため、`;` コメント行または内部タイミング調整として扱います:
+
 - `0xFE`: OPM レジスタ直書き (`y{reg},{val}`)
-- `0xF0`: キーオンディレイ
-- `0xEF`: Sync send
-- `0xEE`: Sync wait
+- `0xF0`: キーオンディレイ (`k{n}` コメント)
+- `0xEF`: Sync send (`S{ch}` コメント)
+- `0xEE`: Sync wait (休符パディングに反映)
 - `0xED`: ADPCM/ノイズ周波数
 - `0xEA`–`0xEC`: LFO (OPM/Amplitude/Pitch)
 - `0xE9`: LFO ディレイ
+- `0xE8`: PCM enable (`PCM enable` コメント)
+- `0xE7`: Extended MML (`E7 sub,val` コメント)
 
 ### OPM ドラム/パーカッション推定
 
@@ -78,11 +97,12 @@ FM トラックのうち、短音が多い・音色切替が多い・少数音�
 
 ### 変換オプション
 
-- `--tempo-scale 0.5|1|2`: MDX のテンポ解釈を 1/2 倍、等倍、2 倍に補正します。
+- `--tempo-scale 0.5|1|2`: 出力する **BPM 数値のみ** を 1/2 倍・等倍・2 倍に補正します。音価 tick は変更しません。
 - `--note-case lower|upper`: 音符名を小文字または大文字で出力します。既定は `lower` です。
 - `--volume-command V|v|@V`: MDX のボリュームを出力するコマンドを選びます。既定は MewMMLPad 仕様にある `V` です。
-- `--no-expand-repeat-escape`: リピート脱出を展開せず、コメントとして残します。通常のローカルリピートはグローバルループ位置を保つため常に展開します。
 - `--global-loop-count N`: グローバルループ点以降を合計 `N` 回ぶん再生するように展開します。既定は `2` です。
+- `--no-align-tracks`: チャンネル間 tick 揃え (休符パディング) を無効化します。既定では有効です。
+- `--report`: 変換精度レポート (チャンネル tick 長・DESYNC・非対応コマンド) を stderr に出力します。
 - `--no-pcm`: 9ch 以降の PCM/ADPCM トラックを仮想 `I`-`P` チャンネルとして出力しません。
 - `--portamento`: MDX のポルタメント (`0xF2`) を MewMMLPad の即ベンド構文 (`a4_b`) に変換します。
 
@@ -99,16 +119,18 @@ FM トラックのうち、短音が多い・音色切替が多い・少数音�
 A T120 O4 L8 V100 @0 O4 c4 d4 e4 f4 g4 a4 b4 > c4
 
 ; --- Channel B ---
-B O4 L8 V100 @0 O3 [c4 e4 g4]4
+B O4 L8 V100 @0 O3 c4 e4 g4 c4 e4 g4
 ```
 
 ## 既知の制限
 
 - **LZX 圧縮 MDX 非対応**: DMDX などで解凍してから使用してください。
 - **PCM/ADPCM チャンネル**: MDX の 9ch 以降は仮想 `I`-`P` チャンネルとしてノート変換します。MewMMLPad の有効トラックは `A`-`H` のため、この仮想チャンネルは再生対象外です。PDX サンプル自体は変換しません。
-- **テンポ指定**: MewMMLPad で複数トラック同時に `T` を置くと不安定になるため、同じ tick の `T` は最初の 1 件だけ出力します。
-- **特殊 tick**: MDX の任意 tick 長に近づけるため、必要に応じて `12`、`24`、`48`、`192` などの数値音長やタイ分解を使います。
-- **リピート脱出/全体ループ**: MDX のローカルリピートは、グローバルループ点がリピート内部に入る場合でも位置を保てるように展開されます。MDX のグローバルループ点以降も `--global-loop-count` 回ぶん再生されるように展開します。チャンネルごとの F1 ループは独立に進め、終端の休符パディングは追加しません。
+- **テンポ指定**: MewMMLPad で複数トラック同時に `T` を置くと不安定になるため、同じ tick の `T` は最初の 1 件だけ出力します。`--tempo-scale` は BPM 表示のみ変更し、音価長は変えません。
+- **特殊 tick**: MDX の任意 tick 長に近づけるため、必要に応じて `12`、`24`、`48`、`192` などの数値音長やタイ分解を使います。分解誤差は `--report` に表示されます。
+- **リピート/全体ループ**: ローカルリピート (`0xF6`/`0xF5`/`0xF4`) はバイトコードとして展開します。グローバルループ点以降は `--global-loop-count` 回ぶん展開します。既定で FM チャンネル間 tick を休符で揃え、`--no-align-tracks` で無効化できます。
+- **Sync (`0xEE`/`0xEF`)**: wait 位置で他チャンネルに合わせて休符を挿入します。send 自体はコメント出力です。
+- **キーオンディレイ (`0xF0`)**: 発音開始のみ遅延し、MDX タイムライン tick は変えません。次音符前に `; k{n}` を付けます。
 - **OPM ドラム/パーカッション推定**: FM トラックの演奏パターンからの推定であり、誤検出/未検出の可能性があります。
 - **OPM 音色**: FM 音色データは変換されません。MewMMLPad の内蔵シンセを使用してください。
 

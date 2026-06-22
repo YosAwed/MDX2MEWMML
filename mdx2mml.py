@@ -16,10 +16,10 @@ MDX フォーマット参考:
   python mdx2mml.py song.mdx --dump
 """
 
-import struct
 import sys
 import argparse
 from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # ══════════════════════════════════════════════════════════════════
@@ -67,8 +67,9 @@ def is_tempo_token(token: str) -> bool:
 
 
 TEMPO_MARKER_PREFIX = '$$TEMPO:'
-REPEAT_ESCAPE_MARKER = '$$REPEAT_ESCAPE'
 GLOBAL_LOOP_MARKER = '$$GLOBAL_LOOP'
+SYNC_WAIT_MARKER_PREFIX = '$$SYNC_WAIT:'
+UNSUPPORTED_PREFIX = '$$UNSUPPORTED:'
 
 
 def make_tempo_marker(tick: int, bpm: int) -> str:
@@ -222,76 +223,24 @@ def nonnegative_int(text: str) -> int:
     return value
 
 
-def parse_repeat_end(token: str) -> int | None:
-    """']' または ']n' なら repeat count を返す。"""
-    if not token.startswith(']'):
-        return None
-    count_text = token[1:]
-    if not count_text:
-        return 2
-    return int(count_text) if count_text.isdigit() else None
-
-
-def expand_repeats(tokens: list[str], expand_escape: bool = True) -> list[str]:
-    """
-    ローカルリピートを展開する。
-
-    [ pre / post ]n は pre+post を n-1 回、最後に pre を出力する。
-    グローバルループ点がリピート内部に入る MDX があるため、通常リピートも展開する。
-    """
-    result = []
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok != '[':
-            result.append(tok)
-            i += 1
-            continue
-
-        depth = 1
-        j = i + 1
-        while j < len(tokens) and depth:
-            if tokens[j] == '[':
-                depth += 1
-            elif parse_repeat_end(tokens[j]) is not None:
-                depth -= 1
-            j += 1
-
-        if depth:
-            result.append(tok)
-            i += 1
-            continue
-
-        end_token = tokens[j - 1]
-        count = parse_repeat_end(end_token) or 2
-        inner = expand_repeats(tokens[i + 1:j - 1], expand_escape)
-
-        if REPEAT_ESCAPE_MARKER not in inner or not expand_escape:
-            for _ in range(max(0, count)):
-                result.extend(inner)
-        else:
-            escape_idx = inner.index(REPEAT_ESCAPE_MARKER)
-            pre = inner[:escape_idx]
-            post = [t for t in inner[escape_idx + 1:] if t != REPEAT_ESCAPE_MARKER]
-            for _ in range(max(0, count - 1)):
-                result.extend(pre)
-                result.extend(post)
-            result.extend(pre)
-
-        i = j
-    return result
-
-
 LEN_TO_TICK = {v: k for k, v in TICK_TO_LEN.items()}
+
+
+def mml_lengths_to_ticks(lengths: list[str]) -> int:
+    """MML 音価列の合計 tick を返す。"""
+    return sum(LEN_TO_TICK.get(length, 24) for length in lengths)
+
+
+def duration_approximation_error(original_ticks: int, lengths: list[str]) -> int:
+    """音価分解の誤差 tick を返す。"""
+    return abs(original_ticks - mml_lengths_to_ticks(lengths))
 
 
 def token_duration_ticks(token: str) -> int:
     """変換後 MML トークンのおおよその tick 長を返す。"""
     if not token or token.startswith(';') or token.startswith('$'):
         return 0
-    if token in ('[', '<', '>', '(', ')'):
-        return 0
-    if parse_repeat_end(token) is not None:
+    if token in ('<', '>', '(', ')'):
         return 0
     if token[0] not in 'RrCcDdEeFfGgAaBb':
         return 0
@@ -316,33 +265,8 @@ def token_duration_ticks(token: str) -> int:
 
 
 def tokens_duration_ticks(tokens: list[str]) -> int:
-    """リピート構文を考慮してトークン列の tick 長を返す。"""
-    total = 0
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok != '[':
-            total += token_duration_ticks(tok)
-            i += 1
-            continue
-
-        depth = 1
-        j = i + 1
-        while j < len(tokens) and depth:
-            if tokens[j] == '[':
-                depth += 1
-            elif parse_repeat_end(tokens[j]) is not None:
-                depth -= 1
-            j += 1
-
-        if depth:
-            i += 1
-            continue
-
-        count = parse_repeat_end(tokens[j - 1]) or 2
-        total += tokens_duration_ticks(tokens[i + 1:j - 1]) * count
-        i = j
-    return total
+    """トークン列の tick 長を返す。"""
+    return sum(token_duration_ticks(tok) for tok in tokens)
 
 
 def loop_body_duration_ticks(tokens: list[str]) -> int:
@@ -358,26 +282,6 @@ def rest_tokens_for_ticks(ticks: int) -> list[str]:
     return ['R' + length for length in ticks_to_mml_lengths(ticks)] if ticks > 0 else []
 
 
-def expand_global_loop(
-    tokens: list[str],
-    loop_count: int,
-    target_loop_ticks: int | None = None,
-) -> list[str]:
-    """グローバルループ点以降を指定回数ぶん展開し、必要なら区間末尾を休符で揃える。"""
-    if GLOBAL_LOOP_MARKER not in tokens:
-        return tokens
-    marker_idx = tokens.index(GLOBAL_LOOP_MARKER)
-    intro = tokens[:marker_idx]
-    loop_body = tokens[marker_idx + 1:]
-    loop_ticks = tokens_duration_ticks(loop_body)
-    pad_ticks = max(0, (target_loop_ticks or loop_ticks) - loop_ticks)
-    loop_body_with_pad = loop_body + rest_tokens_for_ticks(pad_ticks)
-    expanded = list(intro)
-    for _ in range(max(0, loop_count)):
-        expanded.extend(loop_body_with_pad)
-    return expanded
-
-
 def split_global_segments(tokens: list[str]) -> list[list[str]]:
     """内部グローバルループマーカーでトークン列を分割する。"""
     segments = [[]]
@@ -387,6 +291,18 @@ def split_global_segments(tokens: list[str]) -> list[list[str]]:
         else:
             segments[-1].append(token)
     return segments
+
+
+def align_channel_total_ticks(channels: dict[str, list[str]]) -> dict[str, list[str]]:
+    """全チャンネルを最長 tick に休符パディングする (F1 ループなし向け)。"""
+    if not channels:
+        return channels
+    target = max(tokens_duration_ticks(tokens) for tokens in channels.values())
+    aligned = {}
+    for ch, tokens in channels.items():
+        pad = target - tokens_duration_ticks(tokens)
+        aligned[ch] = tokens + rest_tokens_for_ticks(pad)
+    return aligned
 
 
 def align_global_loop_segments(channels: dict[str, list[str]]) -> dict[str, list[str]]:
@@ -418,12 +334,240 @@ def align_global_loop_segments(channels: dict[str, list[str]]) -> dict[str, list
     return aligned
 
 
+def align_tracks_channels(channels: dict[str, list[str]]) -> dict[str, list[str]]:
+    """F1 区間または全体でチャンネル tick を揃える。"""
+    if any(GLOBAL_LOOP_MARKER in tokens for tokens in channels.values()):
+        return align_global_loop_segments(channels)
+    return align_channel_total_ticks(channels)
+
+
 def remove_internal_markers(channels: dict[str, list[str]]) -> dict[str, list[str]]:
     """出力前に内部マーカーを取り除く。"""
+    skip_prefixes = (
+        TEMPO_MARKER_PREFIX,
+        SYNC_WAIT_MARKER_PREFIX,
+        UNSUPPORTED_PREFIX,
+    )
     return {
-        ch: [token for token in tokens if token != GLOBAL_LOOP_MARKER]
+        ch: [
+            token for token in tokens
+            if token != GLOBAL_LOOP_MARKER
+            and not any(token.startswith(prefix) for prefix in skip_prefixes)
+        ]
         for ch, tokens in channels.items()
     }
+
+
+@dataclass
+class ChannelTimeline:
+    """チャンネル 1 本の tick タイムライン。"""
+    channel: str
+    total_ticks: int
+    segment_ticks: list[int] = field(default_factory=list)
+    tempo_events: list[tuple[int, str]] = field(default_factory=list)
+
+
+@dataclass
+class ConversionReport:
+    """変換精度レポート。"""
+    channel_timelines: dict[str, ChannelTimeline] = field(default_factory=dict)
+    desync_segments: list[tuple[int, int, str, str]] = field(default_factory=list)
+    unsupported_commands: Counter = field(default_factory=Counter)
+    duration_approx_errors: list[tuple[str, int, int]] = field(default_factory=list)
+    aligned: bool = False
+
+    @property
+    def max_desync(self) -> int:
+        return max((delta for _, delta, _, _ in self.desync_segments), default=0)
+
+
+def extract_tempo_events(tokens: list[str]) -> list[tuple[int, str]]:
+    """内部テンポマーカーから (tick, Tn) 一覧を返す。"""
+    events = []
+    for token in tokens:
+        marker = parse_tempo_marker(token)
+        if marker is not None:
+            events.append(marker)
+    return events
+
+
+def analyze_channel_timeline(channel: str, tokens: list[str]) -> ChannelTimeline:
+    """チャンネル 1 本の tick タイムラインを解析する。"""
+    segments = split_global_segments(tokens) if GLOBAL_LOOP_MARKER in tokens else [tokens]
+    segment_ticks = [tokens_duration_ticks(segment) for segment in segments]
+    return ChannelTimeline(
+        channel=channel,
+        total_ticks=sum(segment_ticks),
+        segment_ticks=segment_ticks,
+        tempo_events=extract_tempo_events(tokens),
+    )
+
+
+def build_conversion_report(
+    channels: dict[str, list[str]],
+    unsupported: Counter | None = None,
+    duration_errors: list[tuple[str, int, int]] | None = None,
+    aligned: bool = False,
+) -> ConversionReport:
+    """全チャンネルの変換レポートを構築する。"""
+    timelines = {
+        ch: analyze_channel_timeline(ch, tokens)
+        for ch, tokens in channels.items()
+    }
+    desync_segments: list[tuple[int, int, str, str]] = []
+    if timelines:
+        segment_count = max((len(t.segment_ticks) for t in timelines.values()), default=1)
+        for index in range(segment_count):
+            lengths = {
+                ch: (
+                    timeline.segment_ticks[index]
+                    if index < len(timeline.segment_ticks)
+                    else 0
+                )
+                for ch, timeline in timelines.items()
+            }
+            max_tick = max(lengths.values(), default=0)
+            min_tick = min(lengths.values(), default=0)
+            if max_tick != min_tick:
+                for ch, tick in lengths.items():
+                    if tick < max_tick:
+                        desync_segments.append((index, max_tick - tick, ch, 'shorter'))
+    return ConversionReport(
+        channel_timelines=timelines,
+        desync_segments=desync_segments,
+        unsupported_commands=Counter(unsupported or {}),
+        duration_approx_errors=list(duration_errors or []),
+        aligned=aligned,
+    )
+
+
+def format_conversion_report(report: ConversionReport) -> str:
+    """レポートを人間可読テキストに整形する。"""
+    lines = ['=== MDX2MML conversion report ===']
+    if report.channel_timelines:
+        summary = ' | '.join(
+            f'ch {ch}: {timeline.total_ticks} ticks'
+            for ch, timeline in sorted(report.channel_timelines.items())
+        )
+        lines.append(summary)
+    if report.desync_segments:
+        lines.append('DESYNC:')
+        for index, delta, channel, reason in report.desync_segments:
+            lines.append(f'  segment #{index}: ch {channel} {reason} by {delta} ticks')
+        lines.append(f'max desync: {report.max_desync} ticks')
+    elif report.channel_timelines:
+        lines.append('DESYNC: none')
+    if report.unsupported_commands:
+        parts = [
+            f'0x{cmd:02X} x{count}'
+            for cmd, count in sorted(report.unsupported_commands.items())
+        ]
+        lines.append('unsupported: ' + ', '.join(parts))
+    if report.duration_approx_errors:
+        lines.append('duration approx:')
+        for channel, original, error in report.duration_approx_errors[:20]:
+            lines.append(f'  ch {channel}: {original} ticks, error ±{error}')
+        if len(report.duration_approx_errors) > 20:
+            lines.append(f'  ... and {len(report.duration_approx_errors) - 20} more')
+    lines.append(f'align-tracks: {"on" if report.aligned else "off"}')
+    return '\n'.join(lines)
+
+
+def make_sync_wait_marker(elapsed_ticks: int) -> str:
+    return f'{SYNC_WAIT_MARKER_PREFIX}{elapsed_ticks}'
+
+
+def parse_sync_wait_marker(token: str) -> int | None:
+    if not token.startswith(SYNC_WAIT_MARKER_PREFIX):
+        return None
+    text = token[len(SYNC_WAIT_MARKER_PREFIX):]
+    return int(text) if text.isdigit() else None
+
+
+def insert_tokens_at_tick(
+    tokens: list[str],
+    target_tick: int,
+    insert: list[str],
+) -> list[str]:
+    """target_tick の位置に insert を差し込む。"""
+    if not insert:
+        return tokens
+    result: list[str] = []
+    elapsed = 0
+    inserted = False
+    for token in tokens:
+        if token == GLOBAL_LOOP_MARKER:
+            result.append(token)
+            continue
+        if not inserted and elapsed >= target_tick:
+            result.extend(insert)
+            inserted = True
+        result.append(token)
+        elapsed += token_duration_ticks(token)
+    if not inserted:
+        result.extend(insert)
+    return result
+
+
+def apply_sync_wait_padding(
+    channels: dict[str, list[str]],
+    mdx: 'MDXFile',
+    track_limit: int = 8,
+) -> dict[str, list[str]]:
+    """
+    0xEE Sync wait 位置で FM チャンネル間の tick を揃える。
+    mdxtools では wait 中はトラックが停止するため、
+    各 wait 時点での最大 elapsed tick まで短いチャンネルを休符で伸ばす。
+    """
+    wait_ticks_by_channel: dict[str, list[int]] = {}
+    for track_idx in range(min(track_limit, len(mdx.tracks))):
+        ch = MDX2MewMML.track_name(track_idx)
+        waits: list[int] = []
+        elapsed = 0
+        pos = 0
+        data = mdx.tracks[track_idx]
+        while pos < len(data):
+            r = cmd_len(data, pos)
+            if r <= 0:
+                break
+            b = data[pos]
+            if b <= 0x7f:
+                elapsed += b + 1
+            elif b <= 0xdf:
+                elapsed += (data[pos + 1] + 1) if pos + 1 < len(data) else 1
+            elif b == 0xee:
+                waits.append(elapsed)
+            elif b == 0xf1:
+                break
+            pos += r
+        if waits:
+            wait_ticks_by_channel[ch] = waits
+
+    if not wait_ticks_by_channel:
+        return channels
+
+    wait_count = max(len(w) for w in wait_ticks_by_channel.values())
+    result = {ch: list(tokens) for ch, tokens in channels.items()}
+    for wait_index in range(wait_count):
+        target = max(
+            waits[wait_index]
+            for waits in wait_ticks_by_channel.values()
+            if wait_index < len(waits)
+        )
+        for ch, waits in wait_ticks_by_channel.items():
+            if wait_index >= len(waits) or ch not in result:
+                continue
+            source_tick = waits[wait_index]
+            pad = target - source_tick
+            if pad <= 0:
+                continue
+            marker = make_sync_wait_marker(source_tick)
+            if marker in result[ch]:
+                idx = result[ch].index(marker)
+                result[ch][idx:idx + 1] = rest_tokens_for_ticks(pad) + [marker]
+            else:
+                result[ch] = insert_tokens_at_tick(result[ch], source_tick, rest_tokens_for_ticks(pad))
+    return result
 
 
 def read_until(data: bytes, pos: int, terminator: bytes) -> tuple:
@@ -530,7 +674,6 @@ class MDX2MewMML:
         tempo_scale: float = 1.0,
         note_case: str = 'lower',
         volume_command: str = 'V',
-        expand_repeat_escape: bool = True,
         global_loop_count: int = 2,
         include_pcm: bool = True,
         emit_portamento: bool = False,
@@ -539,15 +682,25 @@ class MDX2MewMML:
         self.tempo_scale = tempo_scale
         self.note_names = NOTE_NAMES_MEW_LOWER if note_case == 'lower' else NOTE_NAMES_MEW
         self.volume_command = volume_command
-        self.expand_repeat_escape = expand_repeat_escape
         self.global_loop_count = global_loop_count
         self.include_pcm = include_pcm
         self.emit_portamento = emit_portamento
+        self.unsupported_commands: Counter = Counter()
+        self.duration_approx_errors: list[tuple[str, int, int]] = []
 
     @staticmethod
     def track_name(i: int) -> str:
         """FM 0-7 → A-H、PCM/ADPCM 8-15 → 仮想 I-P。"""
         return chr(ord('A') + i)
+
+    def _record_unsupported(self, opcode: int) -> None:
+        self.unsupported_commands[opcode] += 1
+
+    def _record_duration_error(self, track_idx: int, original_ticks: int, lengths: list[str]) -> None:
+        error = duration_approximation_error(original_ticks, lengths)
+        if error > 0:
+            ch = self.track_name(track_idx)
+            self.duration_approx_errors.append((ch, original_ticks, error))
 
     def detect_opm_percussion(self, track_data: bytes) -> tuple[bool, str]:
         """
@@ -690,6 +843,7 @@ class MDX2MewMML:
         loop_stack_snapshot = None
         loop_state_snapshot = None
         global_loops_done = 0
+        key_on_delay = 0       # 0xF0: 次音符のキーオン遅延 (tick 長は変えない)
 
         # ── グローバルループ点を先行スキャン ─────────────────────
         loop_point = -1
@@ -774,6 +928,7 @@ class MDX2MewMML:
 
                 note_name = self.note_names[note_num % 12]
                 len_parts = ticks_to_mml_lengths(ticks)
+                self._record_duration_error(track_idx, ticks, len_parts)
 
                 # ポルタメント: MewMMLPad の `source<len>_target` 形式 (即ベンド) に変換。
                 # MDX の補間カーブは保持できないため、0xf2 の変化量から終点音程を近似する。
@@ -800,6 +955,10 @@ class MDX2MewMML:
                 # 0xf7 (キーオフ無効) で次音と連結 (タイ) させる
                 if next_key_off:
                     note_token += '&'
+                if key_on_delay:
+                    tokens.append(f'; k{key_on_delay}')
+                    self._record_unsupported(0xf0)
+                    key_on_delay = 0
                 tokens.append(note_token)
                 if portamento and track_idx < 8:
                     portamento = 0
@@ -822,13 +981,14 @@ class MDX2MewMML:
                 reg = data[pos + 1] if pos + 1 < n else 0
                 val = data[pos + 2] if pos + 2 < n else 0
                 tokens.append(f'; y{reg},{val}')
+                self._record_unsupported(0xfe)
 
             elif b == 0xfd:
                 # 音色番号 → @{num} (プログラムチェンジ)
                 tokens.append(f'@{data[pos + 1] if pos + 1 < n else 0}')
 
             elif b == 0xfc:
-                # 出力位相 (パン): 1=右, 2=左, 3=両方(センター), 0=無音
+                # 出力位相 (パン): mdxtools 準拠 1=左, 2=右, 3=センター, 0=無音
                 pv = data[pos + 1] if pos + 1 < n else 3
                 tokens.append(format_pan(pv))
 
@@ -917,18 +1077,19 @@ class MDX2MewMML:
                 break
 
             elif b == 0xf0:
-                # キーオンディレイ (MewMMLPad 非対応 → コメント)
-                kd = data[pos + 1] if pos + 1 < n else 0
-                tokens.append(f'; k{kd}')
+                # キーオンディレイ: 次音符の発音開始のみ遅延 (tick 長は不変)
+                key_on_delay = data[pos + 1] if pos + 1 < n else 0
 
             elif b == 0xef:
-                # Sync send
+                # Sync send (タイムライン不変)
                 ch = data[pos + 1] if pos + 1 < n else 0
                 chn = chr(ord('A') + ch) if ch < 8 else chr(ord('P') + ch - 8)
                 tokens.append(f'; S{chn}')
+                self._record_unsupported(0xef)
 
             elif b == 0xee:
-                tokens.append('; W')  # Sync wait
+                tokens.append(make_sync_wait_marker(elapsed_ticks))
+                self._record_unsupported(0xee)
 
             elif b == 0xed:
                 # ADPCM / ノイズ周波数
@@ -953,12 +1114,31 @@ class MDX2MewMML:
                         p2 = data[pos + 4]
                         p3 = data[pos + 5] - 256 if data[pos + 5] >= 128 else data[pos + 5]
                         tokens.append(f'; {base}{mode},{p1},{p3}')
+                self._record_unsupported(b)
 
             elif b == 0xe9:
                 # LFO ディレイ
                 tokens.append(f'; MD{data[pos + 1] if pos + 1 < n else 0}')
+                self._record_unsupported(0xe9)
 
-            # 0xe8 (PCM enable), 0xe7 (extended MML), 0xe6 → 無視
+            elif b == 0xe8:
+                # PCM4/8 enable (PCM トラック向け)
+                if track_idx >= 8:
+                    tokens.append('; PCM enable')
+                self._record_unsupported(0xe8)
+
+            elif b == 0xe7:
+                # Extended MML (3 bytes)
+                if pos + 2 < n:
+                    sub = data[pos + 1]
+                    val = data[pos + 2]
+                    tokens.append(f'; E7 {sub},{val}')
+                self._record_unsupported(0xe7)
+
+            elif b == 0xe6:
+                self._record_unsupported(0xe6)
+
+            # 0xe6 Informal → 統計のみ
 
             pos += r
 
@@ -966,7 +1146,7 @@ class MDX2MewMML:
         return tokens
 
     def convert(self) -> dict:
-        """各トラックを {チャンネル名: トークンリスト} に変換する。"""
+        """各トラックを {チャンネル名: トークンリスト} に変換する (内部マーカー保持)。"""
         result = {}
         track_limit = 16 if self.include_pcm else 8
         for i, td in enumerate(self.mdx.tracks[:track_limit]):
@@ -978,7 +1158,7 @@ class MDX2MewMML:
             if toks:
                 result[ch] = toks
 
-        return remove_internal_markers(result)
+        return result
 
 # ══════════════════════════════════════════════════════════════════
 # MewMMLPad MML フォーマッター
@@ -1085,10 +1265,11 @@ def convert(
     tempo_scale: float = 1.0,
     note_case: str = 'lower',
     volume_command: str = 'V',
-    expand_repeat_escape: bool = True,
     global_loop_count: int = 2,
     include_pcm: bool = True,
     emit_portamento: bool = False,
+    align_tracks: bool = True,
+    report: bool = False,
 ) -> str:
     path = Path(mdx_path)
     if not path.exists():
@@ -1110,14 +1291,27 @@ def convert(
         tempo_scale=tempo_scale,
         note_case=note_case,
         volume_command=volume_command,
-        expand_repeat_escape=expand_repeat_escape,
         global_loop_count=global_loop_count,
         include_pcm=include_pcm,
         emit_portamento=emit_portamento,
     )
     channels = conv.convert()
+    track_limit = 16 if include_pcm else 8
+    channels = apply_sync_wait_padding(channels, mdx, track_limit=track_limit)
+    if align_tracks:
+        channels = align_tracks_channels(channels)
+    conversion_report = build_conversion_report(
+        channels,
+        unsupported=conv.unsupported_commands,
+        duration_errors=conv.duration_approx_errors,
+        aligned=align_tracks,
+    )
+    channels = remove_internal_markers(channels)
     for ch, toks in channels.items():
         print(f'      ch {ch}: {len(toks)} トークン')
+
+    if report:
+        print(format_conversion_report(conversion_report), file=sys.stderr)
 
     print('[4/4] テキスト整形中...')
     mml_text = format_mewmml(
@@ -1150,7 +1344,7 @@ def main():
   python mdx2mml.py song.mdx
   python mdx2mml.py song.mdx -o output.mml
   python mdx2mml.py song.mdx --dump
-  python mdx2mml.py song.mdx --tempo-scale 0.5 --note-case upper --volume-command V --global-loop-count 3
+  python mdx2mml.py song.mdx --tempo-scale 0.5 --note-case upper --global-loop-count 3 --report
         '''
     )
     ap.add_argument('mdx_file')
@@ -1161,7 +1355,7 @@ def main():
         type=float,
         choices=(0.5, 1.0, 2.0),
         default=1.0,
-        help='テンポを 0.5倍 / 1倍 / 2倍で出力する',
+        help='出力 BPM 表示の倍率 (0.5/1/2)。音価 tick は変更しません',
     )
     ap.add_argument(
         '--note-case',
@@ -1176,15 +1370,20 @@ def main():
         help='MDX ボリュームの出力コマンド。既定は V',
     )
     ap.add_argument(
-        '--no-expand-repeat-escape',
-        action='store_true',
-        help='リピート脱出を展開せずコメントとして残す',
-    )
-    ap.add_argument(
         '--global-loop-count',
         type=nonnegative_int,
         default=2,
         help='グローバルループ点以降の総再生回数。既定は 2',
+    )
+    ap.add_argument(
+        '--no-align-tracks',
+        action='store_true',
+        help='F1 ループ区間ごとのチャンネル間 tick 揃え (休符パディング) を無効化',
+    )
+    ap.add_argument(
+        '--report',
+        action='store_true',
+        help='変換精度レポート (tick 長・DESYNC・非対応コマンド) を stderr に出力',
     )
     ap.add_argument(
         '--no-pcm',
@@ -1206,10 +1405,11 @@ def main():
             tempo_scale=args.tempo_scale,
             note_case=args.note_case,
             volume_command=args.volume_command,
-            expand_repeat_escape=not args.no_expand_repeat_escape,
             global_loop_count=args.global_loop_count,
             include_pcm=not args.no_pcm,
             emit_portamento=args.portamento,
+            align_tracks=not args.no_align_tracks,
+            report=args.report,
         )
     except (FileNotFoundError, ValueError) as e:
         print(f'エラー: {e}', file=sys.stderr)
