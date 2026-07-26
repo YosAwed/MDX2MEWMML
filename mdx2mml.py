@@ -206,12 +206,13 @@ def format_pan(pan_value: int) -> str:
 
 
 def format_volume(volume: int, command: str) -> str:
-    """MDX 音量値を 0-127 に正規化して Vn などで出力する。"""
-    if volume < 16:
-        normalized = round(volume * 127 / 15)
+    """MDX 音量値を MewMMLPad の 0-127 に正規化して Vn などで出力する。"""
+    if volume <= 127:
+        normalized = volume
     else:
-        tl = 255 - volume
-        normalized = max(0, min(127, 127 - tl))
+        # 0xFB は既に音量値なので TL として反転しない。PCM 系の 0-255 値だけを縮尺する。
+        normalized = round(volume * 127 / 255)
+    normalized = max(0, min(127, normalized))
     return f'{command}{normalized}'
 
 
